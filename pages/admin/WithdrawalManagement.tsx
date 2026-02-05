@@ -23,16 +23,14 @@ const WithdrawalManagement = () => {
   }, []);
 
   const handleAction = async (id: string, approve: boolean) => {
-    // Removed window.confirm to prevent UI blocking issues on mobile/webviews
-    // Direct action with visual feedback via loadingId
-
     setLoadingId(id);
     try {
         const res = await mockBackend.processWithdrawal(id, approve);
         if (res.success) {
-            // Optimistic update or wait for fetch
+            // Success: Wait a moment then refresh
             await fetchRequests(); 
         } else {
+            // Show specific error from backend (e.g., "User not found")
             alert(`Error: ${res.message}`);
         }
     } catch (e) {
@@ -125,9 +123,9 @@ const WithdrawalManagement = () => {
                                     ? 'bg-slate-50 border-slate-200 opacity-50 cursor-not-allowed'
                                     : 'bg-red-50 border-red-200 text-red-700 hover:bg-red-100 hover:shadow-md cursor-pointer'
                             }`}
-                            title="Reject"
+                            title="Reject & Refund"
                           >
-                            <X className="w-5 h-5" />
+                             <X className="w-5 h-5" />
                           </button>
                         </div>
                       ) : (

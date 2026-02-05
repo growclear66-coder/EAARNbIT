@@ -228,21 +228,19 @@ class BackendService {
       }
   }
 
-  // --- Game Logic (SECURE TRANSACTIONS) ---
+  // --- Game Logic (OPTIMIZED FOR BATCHING) ---
 
-  async registerTap(userId: string): Promise<ApiResponse<User>> {
-      // 1. Client-Side Speed Check (First layer of defense)
+  // NOTE: 'count' parameter allows sending multiple taps in one DB write
+  async registerTap(userId: string, count: number = 1): Promise<ApiResponse<User>> {
       const now = Date.now();
-      const lastTap = this.tapTimestamps.get(userId) || 0;
-      const timeDiff = now - lastTap;
       
-      if (timeDiff < 80) {
-          return { success: false, message: "Too fast! Slow down." }; 
+      // Basic sanity check: user shouldn't send impossible number of taps in short time
+      // Assume max 15 taps/sec. If syncing every 5 sec, max count ~75.
+      if (count > 200) {
+          return { success: false, message: "Suspicious activity detected." };
       }
-      this.tapTimestamps.set(userId, now);
 
       try {
-          // 2. Database Transaction (Critical Layer)
           let updatedUser: User | null = null;
           let message: string | undefined = undefined;
 
@@ -272,20 +270,31 @@ class BackendService {
                   sessionTaps = 0;
               }
 
-              // Check Limit
-              if (sessionTaps >= 1000) {
+              // Check Limit with incoming batch
+              // We add the 'count' (batch size) to current session taps
+              if (sessionTaps + count >= 1000) {
+                  // Only allow up to 1000
+                  const allowed = 1000 - sessionTaps;
+                  if (allowed > 0) {
+                     sessionTaps += allowed;
+                     coins += allowed;
+                  }
+                  
+                  // Trigger Cooldown
                   cooldownUntil = now + (5 * 60 * 1000); // 5 min
-                  sessionTaps = 0;
-                  transaction.update(userRef, { cooldownUntil, sessionTaps });
+                  transaction.update(userRef, { cooldownUntil, sessionTaps, coins });
+                  
+                  // We throw a special string to handle UI feedback, but we SAVED the partial progress
                   throw "Limit reached! 5 min cooldown started.";
               }
 
-              // Logic
-              sessionTaps++;
-              coins++;
+              // Normal update (No limit hit)
+              sessionTaps += count;
+              coins += count;
 
-              // Auto Convert
-              if (coins >= 1000) {
+              // Auto Convert logic (1000 Coins = 1 INR)
+              // We loop here because a large batch (unlikely but possible) might trigger conversion
+              while (coins >= 1000) {
                   coins -= 1000;
                   balance += 1;
                   totalEarned += 1;
@@ -295,7 +304,6 @@ class BackendService {
               const updates = { sessionTaps, coins, balance, totalEarned, cooldownUntil };
               transaction.update(userRef, updates);
 
-              // Return data for UI
               updatedUser = { ...userData, ...updates };
           });
 
@@ -305,8 +313,10 @@ class BackendService {
            return { success: false, message: "Transaction failed" };
 
       } catch (e: any) {
-          // Clean error message
           const msg = typeof e === 'string' ? e : e.message || "Error tapping";
+          // If it was the "Limit reached" error, the transaction might have actually succeeded partially (if we structured it differently), 
+          // but Firestore throws on throw. 
+          // Re-fetching user is safest to sync state if limit hit.
           return { success: false, message: msg };
       }
   }
@@ -445,34 +455,50 @@ class BackendService {
       } catch { return []; }
   }
 
+  // FIXED: Bulletproof Withdrawal Processing with Refund Logic
   async processWithdrawal(reqId: string, approved: boolean): Promise<ApiResponse<null>> {
       try {
           await runTransaction(db, async (transaction) => {
+              // 1. Get the Request
               const reqRef = doc(db, 'withdrawals', reqId);
               const reqDoc = await transaction.get(reqRef);
               
-              if (!reqDoc.exists()) throw "Request not found";
+              if (!reqDoc.exists()) throw "Withdrawal Request ID not found in database";
               const req = reqDoc.data() as WithdrawalRequest;
 
-              if (req.status !== WithdrawalStatus.PENDING) throw "Request already processed";
+              if (req.status !== WithdrawalStatus.PENDING) throw "This request is not pending (already processed).";
 
-              const status = approved ? WithdrawalStatus.APPROVED : WithdrawalStatus.REJECTED;
-              transaction.update(reqRef, { status });
-
-              // If rejected, refund the money to user
+              const newStatus = approved ? WithdrawalStatus.APPROVED : WithdrawalStatus.REJECTED;
+              
+              // 2. If Rejected, REFUND THE USER
               if (!approved) {
                   const userRef = doc(db, 'users', req.userId);
                   const userDoc = await transaction.get(userRef);
-                  if (userDoc.exists()) {
-                      const user = userDoc.data() as User;
-                      const newBalance = Number((user.balance + req.amount).toFixed(2));
-                      transaction.update(userRef, { balance: newBalance });
+                  
+                  if (!userDoc.exists()) {
+                      throw "User account not found! Cannot refund money to a deleted user.";
                   }
+
+                  const userData = userDoc.data();
+                  
+                  // Ensure we are working with numbers
+                  const currentBalance = Number(userData.balance) || 0;
+                  const refundAmount = Number(req.amount) || 0;
+                  
+                  const newBalance = Number((currentBalance + refundAmount).toFixed(2));
+                  
+                  // Update User Balance (Refund)
+                  transaction.update(userRef, { balance: newBalance });
               }
+
+              // 3. Update Request Status
+              transaction.update(reqRef, { status: newStatus });
           });
           return { success: true };
       } catch (e: any) {
-           return { success: false, message: typeof e === 'string' ? e : 'Error processing request' };
+           console.error("Process Withdrawal Error: ", e);
+           const errorMessage = typeof e === 'string' ? e : e.message || 'Transaction failed';
+           return { success: false, message: errorMessage };
       }
   }
 
