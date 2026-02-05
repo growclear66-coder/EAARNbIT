@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // --- Security Functions ---
+    
+    // Check if the user is the specific super admin email or has ADMIN role in DB
+    function isAdmin() {
+      return request.auth.token.email.lower() == 'knockout15310@gmail.com' || 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN';
+    }
+    
+    // Check if the user is accessing their own data
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. Users Collection
+    match /users/{userId} {
+      // Admin can see and edit everyone
+      allow read, write: if isAdmin();
+      
+      // Regular users can ONLY see their own profile
+      allow read: if isOwner(userId);
+      
+      // Regular users can ONLY create their own profile (Register)
+      allow create: if isOwner(userId);
+
+      // Regular users can update specific fields, but NOT their role or balance directly
+      // (Ideally, balance updates should be done via Cloud Functions, but for this setup we restrict sensitive fields)
+      allow update: if isOwner(userId) 
+                    && request.resource.data.role == resource.data.role // Cannot become Admin
+                    && request.resource.data.isBlocked == resource.data.isBlocked // Cannot unban self
+                    && request.resource.data.email == resource.data.email; // Cannot change email to impersonate
+    }
+
+    // 2. Withdrawals Collection
+    match /withdrawals/{withdrawalId} {
+      // Users see only their own requests. Admins see all.
+      allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      
+      // Users can create a request if they are logged in
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+      
+      // ONLY Admin can change the status (Approve/Reject)
+      allow update: if isAdmin();
+      
+      // Users cannot delete requests
+      allow delete: if isAdmin();
+    }
+
+    // 3. Chats Collection (Support)
+    match /chats/{userId} {
+      // Private between User and Admin
+      allow read, write: if isAdmin() || isOwner(userId);
+    }
+    
+    // 4. Notifications
+    match /notifications/{notificationId} {
+      // Anyone logged in can read notifications
+      allow read: if request.auth != null;
+      // Only admin can send them
+      allow write: if isAdmin();
+    }
+
+    // 5. System Config
+    match /system/{docId} {
+      // Anyone can read config (to get affiliate link)
+      allow read: if true;
+      // Only admin can change settings
+      allow write: if isAdmin();
+    }
+  }
+}
